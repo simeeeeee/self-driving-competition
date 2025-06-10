@@ -25,7 +25,8 @@ from sdk.common import colors, plot_one_box
 from example.self_driving import lane_detect
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.callback_groups import ReentrantCallbackGroup
-from ros_robot_controller_msgs.msg import BuzzerState, SetPWMServoState, PWMServoState
+from ros_robot_controller_msgs.msg import BuzzerState, SetPWMServoState, PWMServoState, ButtonState
+from ros_robot_controller_msgs.msg import RGBStates, RGBState
 
 class SelfDrivingNode(Node):
     def __init__(self, name):
@@ -43,6 +44,19 @@ class SelfDrivingNode(Node):
         self.bridge = CvBridge()
         self.lock = threading.RLock()
         self.colors = common.Colors()
+        #rgb
+        self.publisher_ = self.create_publisher(RGBStates, '/ros_robot_controller/set_rgb', 10)
+        self.subscription = self.create_subscription(
+            Twist,
+            'controller/cmd_vel',
+            self.cmd_vel_callback,
+            10)
+        self.get_logger().info('RGB Controller Node with state-based color has been started.')
+
+        self.state = 'stopped'
+        self.current_color_on = False
+        self.timer = self.create_timer(0.5, self.timer_callback)
+        
         # signal.signal(signal.SIGINT, self.shutdown)
         self.machine_type = os.environ.get('MACHINE_TYPE')
         self.lane_detect = lane_detect.LaneDetector("yellow")
@@ -65,23 +79,61 @@ class SelfDrivingNode(Node):
 
         self.timer = self.create_timer(0.0, self.init_process, callback_group=timer_cb_group)
         self.create_subscription(ButtonState, '/ros_robot_controller/button', self.button_callback, 10)
-        self.enter_client = self.create_client(Trigger, '~/enter')
-        self.enter_client.wait_for_service()
-        self.exit_client = self.create_client(Trigger, '~/exit')
-        self.exit_client.wait_for_service()
 
+        #depth
+        self.depth_image = None
+        
+        
     def button_callback(self, msg):
         if msg.id == 1 and msg.state == 1:
-            req = Trigger.Request()
-            future = self.enter_client.call_async(req)
+            self.enter_srv_callback(Trigger.Request(), Trigger.Response())
             self.start = True
             self.get_logger().info("self driving start")
         elif msg.id == 2 and msg.state == 1:
-            req = Trigger.Request()
-            future = self.exit_client.call_async(req)
+            self.exit_srv_callback(Trigger.Request(), Trigger.Response())
             self.get_logger().info("self driving stop")
-
+    
+    def cmd_vel_callback(self, msg):
+        if msg.linear.x == 0.0 and msg.angular.z == 0.0:
+            self.state = 'stopped'
+        elif abs(msg.angular.z) > 0.2:
+            self.state = 'turning_right'
+        elif msg.linear.x > 0.0:
+            self.state = 'driving'
+        else:
+            self.state = 'stopped'
         
+    def timer_callback(self):
+        if self.state == 'driving':
+            self.publish_color((0, 255, 0))  # Green
+        elif self.state == 'turning_right':
+            if self.current_color_on:
+                self.publish_color((255, 255, 0))  # Yellow
+            else:
+                self.publish_color((0, 0, 0))      # Off
+            self.current_color_on = not self.current_color_on
+        elif self.state == 'stopped':
+            self.publish_color((255, 0, 0))  # Red
+            
+    
+    def publish_color(self, color):
+        msg = RGBStates()
+        msg.states = [
+            RGBState(index=1, red=color[0], green=color[1], blue=color[2]),
+            RGBState(index=2, red=color[0], green=color[1], blue=color[2])
+        ]
+        self.publisher_.publish(msg)    
+
+    # def button_callback(self, msg):
+    #     if msg.id == 1 and msg.state == 1:
+    #         self.get_logger().info("self driving start")
+    #         self.enter_srv_callback(Trigger.Request(), None)
+    #         self.start = True
+    #     elif msg.id == 2 and msg.state == 1:
+    #         self.get_logger().info("self driving stop")
+    #         self.exit_srv_callback(Trigger.Request(), None)
+    
+    
     def init_process(self):
         self.timer.cancel()
 
@@ -95,12 +147,13 @@ class SelfDrivingNode(Node):
             self.enter_srv_callback(Trigger.Request(), Trigger.Response())
             request = SetBool.Request()
             request.data = True
-            self.set_running_srv_callback(request, SetBool.Response())
+            # self.set_running_srv_callback(request, SetBool.Response())
 
         #self.park_action() 
         threading.Thread(target=self.main, daemon=True).start()
         self.create_service(Trigger, '~/init_finish', self.get_node_state)
         self.get_logger().info('\033[1;32m%s\033[0m' % 'start')
+       
 
     def param_init(self):
         self.start = False
@@ -112,7 +165,7 @@ class SelfDrivingNode(Node):
         self.detect_far_lane = False
         self.park_x = -1  # obtain the x-pixel coordinate of a parking sign
 
-        self.start_turn_time_stamp = 0 
+        self.start_turn_time_stamp = 0
         self.count_turn = 0
         self.start_turn = False  # start to turn
 
@@ -130,7 +183,7 @@ class SelfDrivingNode(Node):
         self.crosswalk_length = 0.1 + 0.3  # the length of zebra crossing and the robot
 
         self.start_slow_down = False  # slowing down sign
-        self.normal_speed = 0.1  # normal driving speed
+        self.normal_speed = 0.2  # normal driving speed 0.1->0.2
         self.slow_down_speed = 0.1  # slowing down speed
 
         self.traffic_signs_status = None  # record the state of the traffic lights
@@ -157,6 +210,10 @@ class SelfDrivingNode(Node):
             camera = 'depth_cam'#self.get_parameter('depth_camera_name').value
             self.create_subscription(Image, '/ascamera/camera_publisher/rgb0/image' , self.image_callback, 1)
             self.create_subscription(ObjectsInfo, '/yolov5_ros2/object_detect', self.get_object_callback, 1)
+            
+            #depth
+            self.create_subscription(Image,'/ascamera/camera_publisher/depth0/image_raw',self.depth_callback,10)
+            self.get_logger().info(f"depth start")
             self.mecanum_pub.publish(Twist())
             self.enter = True
         response.success = True
@@ -243,26 +300,6 @@ class SelfDrivingNode(Node):
             self.mecanum_pub.publish(twist)
             time.sleep(1.5)
         self.mecanum_pub.publish(Twist())
-        
-    
-    def button_callback(self, msg):
-        if msg.id == 1:
-            self.process_button_press('Button 1', msg.state)
-            self.enter_srv_callback(Trigger.Request(), Trigger.Response())
-            self.start = True
-        elif msg.id == 2:
-            self.process_button_press('Button 2', msg.state)
-            self.exit_srv_callback(Trigger.Request(), Trigger.Response())
-            
-
-    def process_button_press(self, button_name, state):
-        if state == 1:
-            self.get_logger().info(f'{button_name} short press detected')
-            # You can add additional logic here for short press
-        elif state == 2:
-            self.get_logger().info(f'{button_name} long press detected')
-            # You can add additional logic here for long press
-            
 
     def main(self):
         while self.is_running:
@@ -325,6 +362,20 @@ class SelfDrivingNode(Node):
                     else:
                         self.count_park = 0  
 
+                #  If the robot detects a stop sign and a crosswalk, it will slow down to ensure stable recognition
+                # if 0 < self.park_x and 135 < self.crosswalk_distance:
+                #     twist.linear.x = self.slow_down_speed
+                #     if not self.start_park and 180 < self.crosswalk_distance:  # When the robot is close enough to the crosswalk, it will start parking
+                #         self.count_park += 1  
+                #         if self.count_park >= 15 and self.sign_distance <= 50:  
+                #             self.mecanum_pub.publish(Twist())  
+                #             self.start_park = True
+                #             self.stop = True
+                #             threading.Thread(target=self.park_action).start()
+                #     else:
+                #         self.count_park = 0  
+                
+                
                 # line following processing
                 result_image, lane_angle, lane_x = self.lane_detect(binary_image, image.copy())  # the coordinate of the line while the robot is in the middle of the lane
                 if lane_x >= 0 and not self.stop:  
@@ -389,9 +440,16 @@ class SelfDrivingNode(Node):
                 time.sleep(time_d)
         self.mecanum_pub.publish(Twist())
         rclpy.shutdown()
+        
+    #depth
+    def depth_callback(self, msg):
+        try:
+            self.depth_image = self.bridge.imgmsg_to_cv2(msg, '16UC1')  # depth image 저장
+            self.get_logger().info(f"Depth image-----------------------------------")
+        except Exception as e:
+            self.get_logger().error(f"Depth image conversion failed: {e}")
 
-
-    # Obtain the target detection result
+    # # Obtain the target detection result
     def get_object_callback(self, msg):
         self.objects_info = msg.objects
         if self.objects_info == []:  # If it is not recognized, reset the variable
@@ -402,6 +460,25 @@ class SelfDrivingNode(Node):
             for i in self.objects_info:
                 class_name = i.class_name
                 center = (int((i.box[0] + i.box[2])/2), int((i.box[1] + i.box[3])/2))
+                score = i.score
+                
+                # Depth 값 추출
+                try:
+                    depth_val = self.depth_image[center[0], center[1]]  # 단위: mm
+                    distance_m = depth_val / 1000.0  # m 단위 변환
+                    self.get_logger().info(f"depth value : {distance_m}")
+                except IndexError:
+                    self.get_logger().warn(f"Invalid depth index: ({center[0]}, {center[1]})")
+                    continue
+
+                # Confidence 70% 이상, 거리 0.5m 이하 조건 필터
+                if score < 0.7 or distance_m > 0.5:
+                    continue
+                
+                # # Confidence 70% 이상 
+                # if score < 0.7:
+                #     self.get_logger().info(f"length : {length}")
+                #     continue  # 조건 미달 시 처리 생략
                 
                 if class_name == 'crosswalk':  
                     if center[1] > min_distance:  # Obtain recent y-axis pixel coordinate of the crosswalk
@@ -420,6 +497,8 @@ class SelfDrivingNode(Node):
 
             self.get_logger().info('\033[1;32m%s\033[0m' % class_name)
             self.crosswalk_distance = min_distance
+    
+    
 
 def main():
     node = SelfDrivingNode('self_driving')
