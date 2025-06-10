@@ -64,7 +64,24 @@ class SelfDrivingNode(Node):
         self.stop_yolov5_client.wait_for_service()
 
         self.timer = self.create_timer(0.0, self.init_process, callback_group=timer_cb_group)
+        self.create_subscription(ButtonState, '/ros_robot_controller/button', self.button_callback, 10)
+        self.enter_client = self.create_client(Trigger, '~/enter')
+        self.enter_client.wait_for_service()
+        self.exit_client = self.create_client(Trigger, '~/exit')
+        self.exit_client.wait_for_service()
 
+    def button_callback(self, msg):
+        if msg.id == 1 and msg.state == 1:
+            req = Trigger.Request()
+            future = self.enter_client.call_async(req)
+            self.start = True
+            self.get_logger().info("self driving start")
+        elif msg.id == 2 and msg.state == 1:
+            req = Trigger.Request()
+            future = self.exit_client.call_async(req)
+            self.get_logger().info("self driving stop")
+
+        
     def init_process(self):
         self.timer.cancel()
 
@@ -95,7 +112,7 @@ class SelfDrivingNode(Node):
         self.detect_far_lane = False
         self.park_x = -1  # obtain the x-pixel coordinate of a parking sign
 
-        self.start_turn_time_stamp = 0
+        self.start_turn_time_stamp = 0 
         self.count_turn = 0
         self.start_turn = False  # start to turn
 
@@ -226,6 +243,26 @@ class SelfDrivingNode(Node):
             self.mecanum_pub.publish(twist)
             time.sleep(1.5)
         self.mecanum_pub.publish(Twist())
+        
+    
+    def button_callback(self, msg):
+        if msg.id == 1:
+            self.process_button_press('Button 1', msg.state)
+            self.enter_srv_callback(Trigger.Request(), Trigger.Response())
+            self.start = True
+        elif msg.id == 2:
+            self.process_button_press('Button 2', msg.state)
+            self.exit_srv_callback(Trigger.Request(), Trigger.Response())
+            
+
+    def process_button_press(self, button_name, state):
+        if state == 1:
+            self.get_logger().info(f'{button_name} short press detected')
+            # You can add additional logic here for short press
+        elif state == 2:
+            self.get_logger().info(f'{button_name} long press detected')
+            # You can add additional logic here for long press
+            
 
     def main(self):
         while self.is_running:
